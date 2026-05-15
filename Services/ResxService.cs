@@ -6,6 +6,7 @@ using SplatDev.TranslationTool.Models;
 
 using System.Globalization;
 using System.IO;
+using System.Text.RegularExpressions;
 using System.Xml.Linq;
 
 namespace SplatDev.TranslationTool.Services;
@@ -310,9 +311,17 @@ public class ResxService(ILogger<ResxService> logger)
         var files = Directory.GetFiles(directory, $"{baseName}.*.resx");
         var availableCodes = new List<string>();
 
+        // Exclude the source file itself so the source language is not shown as "already translated".
+        var sourceFileNameOnly = Path.GetFileNameWithoutExtension(sourceFilePath);
+
         foreach (var file in files)
         {
             var fileNameOnly = Path.GetFileNameWithoutExtension(file);
+            if (string.Equals(fileNameOnly, sourceFileNameOnly, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
             var prefix = $"{baseName}.";
             if (!fileNameOnly.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
             {
@@ -320,7 +329,7 @@ public class ResxService(ILogger<ResxService> logger)
             }
 
             var langCode = fileNameOnly[prefix.Length..];
-            if (!IsLanguageCode(langCode))
+            if (!IsLanguageCode(langCode) && !LooksLikeLanguageCode(langCode))
             {
                 continue;
             }
@@ -349,9 +358,17 @@ public class ResxService(ILogger<ResxService> logger)
         var files = Directory.GetFiles(directory, $"{baseName}-*.xml");
         var availableCodes = new List<string>();
 
+        // Exclude the source file itself so the source language is not shown as "already translated".
+        var sourceFileNameOnly = Path.GetFileNameWithoutExtension(sourceFilePath);
+
         foreach (var file in files)
         {
             var fileNameOnly = Path.GetFileNameWithoutExtension(file);
+            if (string.Equals(fileNameOnly, sourceFileNameOnly, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
             var prefix = $"{baseName}-";
             if (!fileNameOnly.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
             {
@@ -359,7 +376,10 @@ public class ResxService(ILogger<ResxService> logger)
             }
 
             var langCode = fileNameOnly[prefix.Length..];
-            if (!IsLanguageCode(langCode))
+
+            // Accept codes known to .NET, or any suffix that structurally resembles a locale
+            // code (e.g. "pt-br", "zh-hans", "xx") so non-standard packs are not silently skipped.
+            if (!IsLanguageCode(langCode) && !LooksLikeLanguageCode(langCode))
             {
                 continue;
             }
@@ -405,6 +425,25 @@ public class ResxService(ILogger<ResxService> logger)
 
         var normalized = code.Replace('_', '-').Trim().ToLowerInvariant();
         return KnownLanguageCodes.Value.Contains(normalized);
+    }
+
+    /// <summary>
+    /// Returns true when <paramref name="code"/> structurally resembles a locale identifier
+    /// (e.g. "xx", "pt-br", "zh-hans", "zh-hant-tw") even if .NET does not recognise it as
+    /// a registered culture.  Used as a fallback so sibling language packs that carry
+    /// non-standard or custom locale codes are not silently ignored.
+    /// </summary>
+    private static bool LooksLikeLanguageCode(string code)
+    {
+        if (string.IsNullOrWhiteSpace(code))
+        {
+            return false;
+        }
+
+        // Accepts: 2–8 alpha chars, optionally followed by one or more
+        // hyphen-separated segments of 2–8 alphanumeric chars.
+        // Examples that match: "pt", "pt-br", "zh-hans", "zh-hant-tw", "en-419"
+        return Regex.IsMatch(code.Trim(), @"^[a-zA-Z]{2,8}(-[a-zA-Z0-9]{2,8})*$", RegexOptions.None, TimeSpan.FromMilliseconds(100));
     }
 
     private static string NormalizeToXmlLanguageCode(string code)

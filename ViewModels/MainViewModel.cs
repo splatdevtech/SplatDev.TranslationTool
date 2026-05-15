@@ -8,6 +8,7 @@ using SplatDev.TranslationTool.Services;
 
 using System.Collections.ObjectModel;
 using System.IO;
+using System.Text;
 
 using Application = System.Windows.Application;
 using WinForms = System.Windows.Forms;
@@ -22,6 +23,8 @@ public partial class MainViewModel : ObservableObject
     private readonly PerplexityTranslationService _perplexityService;
     private readonly AzureTranslationService _azureService;
     private readonly ResxService _resxService;
+    private readonly List<ResxEntry> _failedEntries = [];
+    private string _failedTranslationsLogPath = string.Empty;
     private CancellationTokenSource? _cancellationTokenSource;
 
     [ObservableProperty]
@@ -72,6 +75,12 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private bool _canOpenEditor;
 
+    [ObservableProperty]
+    private bool _canRetryFailed;
+
+    [ObservableProperty]
+    private int _failedTranslationsCount;
+
     public ObservableCollection<LanguageInfo> AvailableLanguages { get; } = [];
     public ObservableCollection<string> TranslationLog { get; } = [];
 
@@ -117,12 +126,14 @@ public partial class MainViewModel : ObservableObject
 
     partial void OnSourceFilePathChanged(string value)
     {
+        ClearFailedEntries();
         UpdateAvailableLanguages();
         UpdateCanTranslate();
     }
 
     partial void OnSelectedLanguageChanged(LanguageInfo? value)
     {
+        ClearFailedEntries();
         UpdateCanTranslate();
     }
 
@@ -198,16 +209,18 @@ public partial class MainViewModel : ObservableObject
             ? !string.IsNullOrEmpty(AzureApiKey) && !string.IsNullOrEmpty(AzureRegion)
             : !string.IsNullOrEmpty(PerplexityApiKey);
 
-        CanTranslate = !string.IsNullOrEmpty(SourceFilePath)
-            && File.Exists(SourceFilePath)
-            && SelectedLanguage != null
-            && hasValidCredentials
-            && !IsTranslating;
-
-        CanOpenEditor = !string.IsNullOrEmpty(SourceFilePath)
+        var hasValidTranslationContext = !string.IsNullOrEmpty(SourceFilePath)
             && File.Exists(SourceFilePath)
             && SelectedLanguage != null
             && hasValidCredentials;
+
+        CanTranslate = hasValidTranslationContext && !IsTranslating;
+
+        CanOpenEditor = hasValidTranslationContext;
+
+        CanRetryFailed = hasValidTranslationContext
+            && !IsTranslating
+            && _failedEntries.Count > 0;
     }
 
     [RelayCommand]
@@ -261,6 +274,8 @@ public partial class MainViewModel : ObservableObject
         if (SelectedLanguage == null || string.IsNullOrEmpty(SourceFilePath))
             return;
 
+        ClearFailedEntries();
+
         IsTranslating = true;
         CanTranslate = false;
         _cancellationTokenSource = new CancellationTokenSource();
@@ -286,6 +301,7 @@ public partial class MainViewModel : ObservableObject
 
             // Get target file path
             var targetFilePath = ResxService.GetTargetFilePath(SourceFilePath, SelectedLanguage.Code);
+            _failedTranslationsLogPath = Path.ChangeExtension(targetFilePath, ".failed.log");
             AddLog($"Target file: {Path.GetFileName(targetFilePath)}");
 
             // Load existing translations to avoid re-translating
@@ -356,6 +372,7 @@ public partial class MainViewModel : ObservableObject
                         // Keep original on failure
                         translatedEntries.Add(entry);
                         failed++;
+                        TrackFailedEntry(entry, result.ErrorMessage);
                         AddLog($"✗ Failed: {entry.Key} - {result.ErrorMessage}");
                     }
                 }
@@ -364,6 +381,7 @@ public partial class MainViewModel : ObservableObject
                     // Keep original on failure
                     translatedEntries.Add(entry);
                     failed++;
+                    TrackFailedEntry(entry, result.ErrorMessage);
                     AddLog($"✗ Failed: {entry.Key} - {result.ErrorMessage}");
                 }
             }
@@ -407,11 +425,147 @@ public partial class MainViewModel : ObservableObject
     }
 
     [RelayCommand]
+    private async Task RetryFailedAsync()
+    {
+        if (SelectedLanguage == null || string.IsNullOrEmpty(SourceFilePath) || _failedEntries.Count == 0)
+        {
+            return;
+        }
+
+        IsTranslating = true;
+        _cancellationTokenSource = new CancellationTokenSource();
+        var token = _cancellationTokenSource.Token;
+
+        try
+        {
+            var targetFilePath = ResxService.GetTargetFilePath(SourceFilePath, SelectedLanguage.Code);
+            _failedTranslationsLogPath = Path.ChangeExtension(targetFilePath, ".failed.log");
+
+            var pendingRetries = _failedEntries.ToList();
+            var retrySucceeded = 0;
+            var retryFailed = 0;
+            var retryUpdates = new List<ResxEntry>();
+
+            ProgressMax = pendingRetries.Count;
+            ProgressValue = 0;
+            AddLog($"Retrying {pendingRetries.Count} failed entries...");
+
+            foreach (var entry in pendingRetries)
+            {
+                token.ThrowIfCancellationRequested();
+
+                ProgressValue++;
+                ProgressText = $"Retrying {ProgressValue}/{ProgressMax}: {entry.Key}";
+
+                var result = UseAzureTranslation
+                    ? await _azureService.TranslateAsync(entry.Value, SelectedLanguage.Code, DetectLanguage ? null : "en", token)
+                    : await _perplexityService.TranslateAsync(entry.Value, SelectedLanguage.Code, SelectedLanguage.DisplayName, token);
+
+                if (result.IsSuccess)
+                {
+                    retrySucceeded++;
+                    retryUpdates.Add(new ResxEntry(entry.Key, result.TranslatedText!, entry.Comment));
+                    _failedEntries.RemoveAll(failedEntry => string.Equals(failedEntry.Key, entry.Key, StringComparison.Ordinal));
+                    AddLog($"✓ Retry succeeded: {entry.Key}");
+                    continue;
+                }
+
+                retryFailed++;
+                TrackFailedEntry(entry, result.ErrorMessage);
+                AddLog($"✗ Retry failed: {entry.Key} - {result.ErrorMessage}");
+            }
+
+            if (retryUpdates.Count > 0)
+            {
+                var saved = _resxService.WriteResxFile(targetFilePath, retryUpdates);
+                if (saved)
+                {
+                    AddLog($"✓ Saved {retryUpdates.Count} retried translations to {Path.GetFileName(targetFilePath)}");
+                }
+                else
+                {
+                    AddLog("✗ Failed to save retried translations");
+                }
+            }
+
+            FailedTranslationsCount = _failedEntries.Count;
+            UpdateCanTranslate();
+
+            var summary = $"Retry complete. Succeeded: {retrySucceeded}, Still failed: {retryFailed}";
+            AddLog(summary);
+            StatusMessage = summary;
+            ProgressText = "Retry complete";
+        }
+        catch (OperationCanceledException)
+        {
+            AddLog("Retry cancelled");
+            StatusMessage = "Retry cancelled";
+        }
+        catch (Exception ex)
+        {
+            AddLog($"ERROR: {ex.Message}");
+            StatusMessage = $"Error: {ex.Message}";
+        }
+        finally
+        {
+            IsTranslating = false;
+            UpdateCanTranslate();
+            _cancellationTokenSource?.Dispose();
+            _cancellationTokenSource = null;
+        }
+    }
+
+    [RelayCommand]
     private void StopTranslation()
     {
         _cancellationTokenSource?.Cancel();
         AddLog("Stopping translation...");
         StatusMessage = "Stopping...";
+    }
+
+    private void ClearFailedEntries()
+    {
+        _failedEntries.Clear();
+        FailedTranslationsCount = 0;
+    }
+
+    private void TrackFailedEntry(ResxEntry entry, string? errorMessage)
+    {
+        _failedEntries.RemoveAll(existing => string.Equals(existing.Key, entry.Key, StringComparison.Ordinal));
+        _failedEntries.Add(entry);
+        FailedTranslationsCount = _failedEntries.Count;
+
+        WriteFailedTranslationLogEntry(entry, errorMessage);
+        UpdateCanTranslate();
+    }
+
+    private void WriteFailedTranslationLogEntry(ResxEntry entry, string? errorMessage)
+    {
+        if (string.IsNullOrWhiteSpace(_failedTranslationsLogPath))
+        {
+            return;
+        }
+
+        try
+        {
+            var builder = new StringBuilder();
+            builder.Append(DateTime.UtcNow.ToString("O"));
+            builder.Append(" | key=").Append(entry.Key);
+            builder.Append(" | language=").Append(SelectedLanguage?.Code);
+            builder.Append(" | service=").Append(UseAzureTranslation ? "Azure" : "Perplexity");
+            builder.Append(" | error=").Append(errorMessage ?? "Unknown error");
+            builder.Append(" | source=").Append(entry.Value.Replace(Environment.NewLine, " "));
+
+            File.AppendAllText(_failedTranslationsLogPath, builder.AppendLine().ToString());
+        }
+        catch (IOException)
+        {
+            AddLog("WARN: Unable to write failed translation log file.");
+        }
+        catch (UnauthorizedAccessException)
+        {
+            AddLog("WARN: No permission to write failed translation log file.");
+        }
     }
 
     private void AddLog(string message)

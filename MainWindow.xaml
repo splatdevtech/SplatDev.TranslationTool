@@ -121,6 +121,11 @@
                     Command="{Binding TranslateAllCommand}"
                     IsEnabled="{Binding CanTranslate}"
                     Background="#4CAF50" Foreground="Black" FontWeight="Bold"/>
+                <Button Content="Retry Failed"
+                    Command="{Binding RetryFailedCommand}"
+                    IsEnabled="{Binding CanRetryFailed}"
+                    Background="#FFB300" Foreground="Black" FontWeight="Bold"
+                    ToolTip="Retry only entries that failed in the last run"/>
                 <Button Content="Stop" 
                     Command="{Binding StopTranslationCommand}"
                     IsEnabled="{Binding IsTranslating}"
