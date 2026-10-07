@@ -1,0 +1,16 @@
+name: Build & Test
+on:
+  pull_request:
+  push:
+    branches: [master]
+jobs:
+  build:
+    name: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: build
+        run: dotnet build SplatDev.TranslationTool.csproj --configuration Release
